@@ -9,7 +9,7 @@ from rampflow.operational_snapshot import SnapshotCodec
 from rampflow.fuel_accounting import FuelTank, FuelLedger
 from rampflow.crew_duty_control import CrewMember, CrewDutyController, DutySegment
 from rampflow.operational_policy import PolicyRule, PolicyContext, PolicyEngine, Effect
-from rampflow.service_windows import ServiceWindowRule, ServiceWindowPlanner
+from rampflow.service_windows import ServiceWindowRule, ServiceWindowPlanner, ServiceWindowError
 from rampflow.resource_dispatch import TravelGraph, MobileResource, ResourceDispatcher, DispatchRequest
 from rampflow.stand_orchestration import StandProfile, StandDemand, StandOrchestrator
 
@@ -64,6 +64,88 @@ class PublicTests(unittest.TestCase):
         ])
         plan=p.plan('F',D(10),D(12),{})
         self.assertLessEqual(plan.bookings['clean'].window.end,plan.bookings['board'].window.start)
+
+    def test_mutual_exclusion_serializes_same_plan_on_one_device(self):
+        p=ServiceWindowPlanner([
+            ServiceWindowRule('ga',0,120,30,mutual_exclusion_group='hot'),
+            ServiceWindowRule('gb',0,120,30,mutual_exclusion_group='hot'),
+        ])
+        plan=p.plan('F',D(10),D(12),{'ga':('DEV1',),'gb':('DEV1',)})
+        a,b=plan.bookings['ga'].window,plan.bookings['gb'].window
+        self.assertFalse(a.overlaps(b))
+        p.commit(plan)
+        self.assertEqual(len(p.resource_bookings['DEV1']),2)
+
+    def test_mutual_exclusion_covers_distinct_devices(self):
+        p=ServiceWindowPlanner([
+            ServiceWindowRule('ga',0,75,30,mutual_exclusion_group='hot'),
+            ServiceWindowRule('gb',0,75,60,mutual_exclusion_group='hot'),
+        ])
+        with self.assertRaises(ServiceWindowError):
+            # Overlapping excluded services cannot fit serially in the window,
+            # even when offered two different devices.
+            p.plan('F',D(10),D(12),{'ga':('DEV1',),'gb':('DEV2',)})
+
+    def test_stale_plan_rejected_when_resource_generation_moves(self):
+        p=ServiceWindowPlanner([
+            ServiceWindowRule('ga',0,120,30,mutual_exclusion_group='hot'),
+            ServiceWindowRule('gb',0,120,30,mutual_exclusion_group='hot'),
+        ])
+        first=p.plan('F1',D(10),D(12),{'ga':('DEV1',)})
+        held=p.plan('F2',D(10),D(12),{'gb':('DEV1',)})
+        p.commit(first)
+        with self.assertRaises(ServiceWindowError):
+            p.commit(held)
+        current=p.plan('F2',D(10),D(12),{'gb':('DEV1',)})
+        self.assertGreaterEqual(
+            current.bookings['gb'].window.start,
+            first.bookings['ga'].window.end,
+        )
+        p.commit(current)
+
+    def test_release_invalidates_plans_planned_before_it(self):
+        p=ServiceWindowPlanner([ServiceWindowRule('a',0,120,30)])
+        p.commit(p.plan('F1',D(10),D(12),{'a':('DEV1',)}))
+        held=p.plan('F2',D(10),D(12),{'a':('DEV1',)})
+        p.release('F1')
+        with self.assertRaises(ServiceWindowError):
+            p.commit(held)
+
+    def test_rejected_plan_reserves_nothing(self):
+        from dataclasses import replace
+        p=ServiceWindowPlanner([
+            ServiceWindowRule('a',0,60,30),
+            ServiceWindowRule('b',0,60,30,prerequisites=frozenset({'a'})),
+        ])
+        plan=p.plan('F',D(10),D(12),{'a':('DEV1',),'b':('DEV1',)})
+        tampered=replace(
+            plan,
+            bookings={
+                **plan.bookings,
+                'b':replace(plan.bookings['b'],window=Window(D(10,5),D(10,35))),
+            },
+        )
+        with self.assertRaises(ServiceWindowError):
+            p.commit(tampered)
+        self.assertEqual(p.committed,{})
+        self.assertEqual(p.resource_bookings,{})
+
+    def test_delay_revision_is_validated_and_old_plan_goes_stale(self):
+        p=ServiceWindowPlanner([
+            ServiceWindowRule('clean',0,120,10),
+            ServiceWindowRule('board',0,120,20,prerequisites=frozenset({'clean'})),
+        ])
+        original=p.plan('F',D(10),D(12),{})
+        p.commit(original)
+        p.commit(p.delay('F',15))
+        self.assertEqual(p.committed['F'].generation,2)
+        with self.assertRaises(ServiceWindowError):
+            p.commit(original)
+        p2=ServiceWindowPlanner([ServiceWindowRule('a',0,30,20)])
+        p2.commit(p2.plan('F',D(10),D(12),{}))
+        with self.assertRaises(ServiceWindowError):
+            p2.delay('F',200)
+        self.assertEqual(p2.generation,1)
 
     def test_dispatch_shortest_path(self):
         g=TravelGraph();g.add('A','B',100);g.add('B','C',100);g.add('A','C',500)
