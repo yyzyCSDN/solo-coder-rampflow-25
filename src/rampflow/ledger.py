@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from threading import RLock
-from typing import Generic, TypeVar, Iterable
+from typing import Generic, TypeVar, Iterable, Callable
 from .timeutil import Window, utc
 
 T=TypeVar("T")
@@ -14,6 +14,11 @@ class Reservation(Generic[T]):
     window: Window
     payload: T
     generation: int
+    exclusive: bool = True
+
+def exclusive_compat(a: "Reservation[object]", b: "Reservation[object]") -> bool:
+    """Default rule shared by every planner: exclusive holds block any overlap."""
+    return not (a.exclusive or b.exclusive)
 
 class ConflictError(RuntimeError):
     pass
@@ -39,23 +44,36 @@ class ReservationLedger(Generic[T]):
     def reservations(self,resource_id:str)->tuple[Reservation[T],...]:
         with self._lock:
             return tuple(self._by_resource.get(resource_id,()))
-    def conflicts(self,resource_id:str,window:Window)->tuple[Reservation[T],...]:
+    def conflicts(self,resource_id:str,window:Window,exclusive:bool=True,
+                  compatible:Callable[[Reservation[T],Reservation[T]],bool]|None=None
+                  )->tuple[Reservation[T],...]:
         with self._lock:
-            return tuple(r for r in self._by_resource.get(resource_id,()) if r.window.overlaps(window))
-    def reserve(self,resource_id:str,window:Window,payload:T,expected_generation:int|None=None)->Reservation[T]:
+            probe=Reservation(-1,resource_id,window,None,0,exclusive)  # type: ignore[arg-type]
+            rule=compatible or exclusive_compat
+            return tuple(r for r in self._by_resource.get(resource_id,())
+                         if r.window.overlaps(window) and not rule(probe,r))
+    def reserve(self,resource_id:str,window:Window,payload:T,expected_generation:int|None=None,
+                exclusive:bool=True,
+                compatible:Callable[[Reservation[T],Reservation[T]],bool]|None=None
+                )->Reservation[T]:
         with self._lock:
             if expected_generation is not None and expected_generation != self._generation:
                 raise StaleGeneration(f"expected {expected_generation}, actual {self._generation}")
-            conflicts=[r for r in self._by_resource.get(resource_id,()) if r.window.overlaps(window)]
+            rule=compatible or exclusive_compat
+            probe=Reservation(-1,resource_id,window,payload,self._generation+1,exclusive)
+            conflicts=[r for r in self._by_resource.get(resource_id,())
+                       if r.window.overlaps(window) and not rule(probe,r)]
             if conflicts:
                 raise ConflictError(f"{resource_id} unavailable")
-            item=Reservation(self._next_token,resource_id,window,payload,self._generation+1)
+            item=Reservation(self._next_token,resource_id,window,payload,self._generation+1,exclusive)
             self._next_token += 1
             self._generation += 1
             self._by_resource.setdefault(resource_id,[]).append(item)
             self._by_resource[resource_id].sort(key=lambda r:(r.window.start,r.window.end,r.token))
             return item
-    def replace(self,token:int,new_window:Window,expected_generation:int)->Reservation[T]:
+    def replace(self,token:int,new_window:Window,expected_generation:int,
+                compatible:Callable[[Reservation[T],Reservation[T]],bool]|None=None
+                )->Reservation[T]:
         with self._lock:
             if expected_generation != self._generation:
                 raise StaleGeneration("ledger changed")
@@ -70,10 +88,13 @@ class ReservationLedger(Generic[T]):
             if found is None:
                 raise KeyError(token)
             rid,item=found
-            conflicts=[r for r in self._by_resource[rid] if r.token != token and r.window.overlaps(new_window)]
+            rule=compatible or exclusive_compat
+            probe=Reservation(token,rid,new_window,item.payload,self._generation+1,item.exclusive)
+            conflicts=[r for r in self._by_resource[rid]
+                       if r.token != token and r.window.overlaps(new_window) and not rule(probe,r)]
             if conflicts:
                 raise ConflictError(f"{rid} unavailable")
-            updated=Reservation(item.token,rid,new_window,item.payload,self._generation+1)
+            updated=Reservation(item.token,rid,new_window,item.payload,self._generation+1,item.exclusive)
             self._by_resource[rid]=[updated if r.token==token else r for r in self._by_resource[rid]]
             self._by_resource[rid].sort(key=lambda r:(r.window.start,r.window.end,r.token))
             self._generation += 1
@@ -92,20 +113,38 @@ class ReservationLedger(Generic[T]):
                     self._generation += 1
                     return True
             return False
-    def bulk_reserve(self,requests:Iterable[tuple[str,Window,T]],expected_generation:int|None=None)->tuple[Reservation[T],...]:
+    def bulk_reserve(self,requests:Iterable[tuple],expected_generation:int|None=None,
+                     exclusive:bool=True,
+                     compatible:Callable[[Reservation[T],Reservation[T]],bool]|None=None
+                     )->tuple[Reservation[T],...]:
+        """Reserve every request or none.
+
+        Requests are ``(resource_id, window, payload)`` triples or
+        ``(resource_id, window, payload, exclusive)`` quadruples.  The same
+        compatibility rule is applied to existing holds and to the staged
+        requests themselves, so a batch that overlaps internally on an
+        exclusive resource is rejected atomically before anything is written.
+        """
         with self._lock:
             if expected_generation is not None and expected_generation != self._generation:
                 raise StaleGeneration("ledger changed")
-            req=list(requests)
-            shadow={k:list(v) for k,v in self._by_resource.items()}
-            for rid,window,_ in req:
-                if any(r.window.overlaps(window) for r in shadow.get(rid,())):
+            rule=compatible or exclusive_compat
+            norm=[]
+            for item in requests:
+                rid,window,payload=item[0],item[1],item[2]
+                req_exclusive=item[3] if len(item)>3 else exclusive
+                norm.append((rid,window,payload,req_exclusive))
+            shadow:dict[str,list[Reservation[T]]]={k:list(v) for k,v in self._by_resource.items()}
+            for idx,(rid,window,payload,req_exclusive) in enumerate(norm):
+                probe=Reservation(-idx-1,rid,window,payload,self._generation,req_exclusive)
+                blocked=[r for r in shadow.get(rid,())
+                         if r.window.overlaps(window) and not rule(probe,r)]
+                if blocked:
                     raise ConflictError(f"{rid} unavailable")
-                placeholder=Reservation(-1,rid,window,None,self._generation)  # type: ignore[arg-type]
-                shadow.setdefault(rid,[]).append(placeholder)
+                shadow.setdefault(rid,[]).append(probe)
             out=[]
-            for rid,window,payload in req:
-                item=Reservation(self._next_token,rid,window,payload,self._generation+1)
+            for rid,window,payload,req_exclusive in norm:
+                item=Reservation(self._next_token,rid,window,payload,self._generation+1,req_exclusive)
                 self._next_token += 1
                 self._generation += 1
                 self._by_resource.setdefault(rid,[]).append(item)
